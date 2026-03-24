@@ -1,0 +1,597 @@
+# =============================================================================
+# CLOUDFORMATION TEMPLATE — Minecraft Java Edition Server on EC2
+# =============================================================================
+#
+# WHAT IS CLOUDFORMATION?
+#   CloudFormation is AWS's Infrastructure-as-Code (IaC) service. Instead of
+#   clicking around the AWS console to create resources, you describe everything
+#   you want in a YAML (or JSON) file called a "template". CloudFormation reads
+#   the template and provisions all the resources for you in the right order,
+#   as a single unit called a "stack".
+#
+#   Benefits:
+#     - Reproducible: deploy the exact same setup in any region/account
+#     - Version-controlled: commit your infrastructure to Git like application code
+#     - Auditable: CloudFormation tracks every change made to a stack
+#     - Reversible: deleting the stack deletes ALL the resources it created
+#
+# HOW TO DEPLOY THIS TEMPLATE:
+#   Via the AWS Console:
+#     1. Go to CloudFormation > Stacks > Create stack
+#     2. Upload this file
+#     3. Fill in the Parameters on the next screen
+#     4. Click through and hit Create
+#
+#   Via the AWS CLI:
+#     aws cloudformation deploy \
+#       --template-file minecraft-server.yaml \
+#       --stack-name my-minecraft-server \
+#       --parameter-overrides ServerJarUrl=https://... KeyPairName=my-key \
+#       --capabilities CAPABILITY_NAMED_IAM
+#
+#   (CAPABILITY_NAMED_IAM is required whenever the template creates IAM resources)
+#
+# WHAT THIS TEMPLATE CREATES:
+#   Networking  : VPC > Subnet > Internet Gateway > Route Table
+#   Security    : Security Group (firewall rules), IAM Role + Instance Profile
+#   Compute     : EC2 instance (ARM Graviton, Amazon Linux 2023)
+#   Connectivity: Elastic IP (static public address)
+#   Bootstrap   : UserData script that installs Java, downloads the server JAR,
+#                 and registers a systemd service so the server starts on boot
+# =============================================================================
+
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  Minecraft Java Edition server on Amazon EC2 (Amazon Linux 2023, ARM Graviton).
+  Provisions a VPC, security group, IAM role for SSM, Elastic IP, and an EC2
+  instance that downloads and runs the server as a systemd service on boot.
+  Designed as a learning template — every section is annotated.
+
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+# Parameters make templates reusable. Instead of hard-coding values like
+# instance size or server port, you declare them here and the user (or a CI/CD
+# pipeline) supplies them at deploy time.
+#
+# Each parameter can have:
+#   Type          — String, Number, or AWS-specific types like AWS::EC2::KeyPair::KeyName
+#   Default       — value used if none is supplied
+#   AllowedValues — a whitelist; CloudFormation rejects anything else
+#   MinValue/MaxValue — range validation for Number types
+#   Description   — shown in the console when filling in the parameter
+# =============================================================================
+Parameters:
+
+  InstanceType:
+    Type: String
+    Default: t4g.small
+    AllowedValues:
+      - t4g.small   # 2 vCPU, 2 GB RAM  — good for 2-5 players
+      - t4g.medium  # 2 vCPU, 4 GB RAM  — comfortable for 5-10 players or Paper + plugins
+      - t4g.large   # 2 vCPU, 8 GB RAM  — larger servers or heavy mod/plugin stacks
+      - m7g.medium  # 2 vCPU, 4 GB RAM  — fixed performance (no bursting), more consistent
+      - m7g.large   # 2 vCPU, 8 GB RAM  — high player counts
+    Description: >
+      EC2 Graviton (ARM) instance type. Upgrade if the server feels sluggish.
+      You can change this later by updating the stack — CloudFormation will
+      stop, resize, and restart the instance automatically.
+
+  ServerJarUrl:
+    Type: String
+    Description: >
+      Direct HTTPS download URL for your chosen server JAR file. This is fetched
+      by the instance at first boot using wget.
+
+  JavaMaxRam:
+    Type: String
+    Default: '1300M'
+    Description: >
+      Maximum JVM heap size. Use M for megabytes or G for gigabytes (e.g. 2G).
+      Must leave headroom for the OS — don't set this to the full instance RAM.
+
+  JavaMinRam:
+    Type: String
+    Default: '1024M'
+    Description: >
+      Minimum JVM heap size. Setting this equal to JavaMaxRam prevents the JVM
+      from resizing the heap at runtime, which improves stability.
+
+  ServerPort:
+    Type: Number
+    Default: 25565
+    MinValue: 1024
+    MaxValue: 65535
+    Description: TCP port Minecraft listens on. 25565 is the standard default.
+
+  Motd:
+    Type: String
+    Default: 'A Minecraft Server on AWS'
+    Description: Message shown in the Minecraft multiplayer server list.
+
+  Difficulty:
+    Type: String
+    Default: easy
+    AllowedValues: [peaceful, easy, normal, hard]
+    Description: In-game difficulty level.
+
+  MaxPlayers:
+    Type: Number
+    Default: 10
+    Description: Maximum simultaneous players.
+
+  OnlineMode:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      'true' = only players with paid Mojang accounts can join (recommended).
+      'false' = offline/unauthenticated clients allowed. Only use for private
+      LAN-style servers where you trust all players.
+
+  AllowSshCidr:
+    Type: String
+    Default: '0.0.0.0/0'
+    Description: >
+      CIDR block allowed to connect on port 22 (SSH).
+      Best practice: set this to YOUR public IP with /32 (e.g. 203.0.113.5/32).
+      To disable SSH entirely and use SSM only, set this to 127.0.0.1/32.
+
+  KeyPairName:
+    Type: String
+    Default: ''
+    Description: >
+      Name of an existing EC2 Key Pair for SSH access. Leave blank to disable
+      SSH key auth — you can still access the instance via SSM Session Manager
+      in the AWS console without any key pair.
+
+  EbsVolumeSize:
+    Type: Number
+    Default: 20
+    MinValue: 8
+    MaxValue: 500
+    Description: Root EBS volume size in GB.
+
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+# Conditions let you make parts of the template optional based on parameter
+# values. They evaluate to true or false, and you can reference them anywhere
+# in Resources or Outputs with !If [ConditionName, value-if-true, value-if-false].
+#
+# Intrinsic functions used here:
+#   !Not    — logical NOT (inverts a boolean)
+#   !Equals — returns true if both values are identical
+#   !Ref    — references a parameter or resource by its logical name
+# =============================================================================
+Conditions:
+
+  # True when the user provided a key pair name; false when left blank.
+  # Used below to conditionally attach the KeyName property to the EC2 instance.
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, '']]
+
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+# This is the main section — it defines every AWS resource to be created.
+# Each resource has:
+#   Type       — the AWS resource type (format: AWS::Service::Resource)
+#   Properties — configuration specific to that resource type
+#   DependsOn  — (optional) forces CloudFormation to wait for another resource
+#                before creating this one. Usually CloudFormation figures out
+#                the order automatically via !Ref / !GetAtt references, but
+#                sometimes you need to be explicit.
+#
+# ARCHITECTURE OVERVIEW:
+#
+#   Internet
+#      |
+#   [Internet Gateway]   <- attached to the VPC; allows traffic in/out
+#      |
+#   [VPC 10.0.0.0/16]
+#      |
+#   [Public Subnet 10.0.1.0/24]
+#      |
+#   [Route Table]        <- directs 0.0.0.0/0 traffic to the Internet Gateway
+#      |
+#   [EC2 Instance]  <--- [Security Group]  (firewall: allows port 25565 + SSH)
+#      |                [IAM Role]         (permissions: SSM + CloudWatch)
+#   [Elastic IP]         (static public IP, associated with the instance)
+# =============================================================================
+Resources:
+
+  # ===========================================================================
+  # NETWORKING
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # VPC (Virtual Private Cloud)
+  # A VPC is your own isolated network within AWS. Think of it as a private
+  # data centre you control. Every resource you launch goes inside a VPC.
+  #
+  # CidrBlock: the IP address range for the entire VPC.
+  #   10.0.0.0/16 gives you 65,536 addresses (10.0.0.0 - 10.0.255.255).
+  #
+  # EnableDnsHostnames: lets EC2 instances get internal DNS names like
+  #   ip-10-0-1-5.eu-west-2.compute.internal — useful for service discovery.
+  # ---------------------------------------------------------------------------
+  MinecraftVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc'
+          # !Sub substitutes ${AWS::StackName} with the actual stack name at
+          # deploy time. AWS::StackName is a "pseudo-parameter" — a built-in
+          # variable CloudFormation provides automatically. Using it in Tags
+          # makes it easy to see which stack owns each resource in the console.
+
+  # ---------------------------------------------------------------------------
+  # SUBNET
+  # A subnet is a slice of the VPC's address space in a single Availability
+  # Zone (AZ). You launch EC2 instances into subnets, not directly into VPCs.
+  #
+  # CidrBlock: 10.0.1.0/24 gives 256 addresses — plenty for one instance.
+  #
+  # MapPublicIpOnLaunch: false — we don't want an auto-assigned public IP
+  #   because we'll attach a static Elastic IP manually instead.
+  #
+  # !Select [0, !GetAZs ''] — picks the first AZ in the current region.
+  #   !GetAZs '' returns a list of AZs (e.g. ["eu-west-2a","eu-west-2b"]).
+  #   !Select [0, ...] picks the first item. This keeps the template region-agnostic.
+  # ---------------------------------------------------------------------------
+  MinecraftSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MinecraftVPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-subnet'
+
+  # ---------------------------------------------------------------------------
+  # INTERNET GATEWAY (IGW)
+  # Without an IGW, the VPC is completely isolated — no internet traffic in or
+  # out. The IGW is the "door" between your VPC and the public internet.
+  # Creating it is not enough; it must also be attached to the VPC (see below).
+  # ---------------------------------------------------------------------------
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-igw'
+
+  # ---------------------------------------------------------------------------
+  # VPC GATEWAY ATTACHMENT
+  # This resource links the IGW to the VPC. It is a separate resource from the
+  # IGW itself because an IGW can theoretically be detached and reattached.
+  # ---------------------------------------------------------------------------
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref MinecraftVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # ---------------------------------------------------------------------------
+  # ROUTE TABLE
+  # A route table is like a router's routing table — it tells the VPC where
+  # to send traffic destined for different IP ranges.
+  # ---------------------------------------------------------------------------
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MinecraftVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-rt'
+
+  # ---------------------------------------------------------------------------
+  # DEFAULT ROUTE
+  # This adds a single route: "send ALL traffic (0.0.0.0/0) to the IGW".
+  # This is what makes the subnet "public" — traffic can reach the internet.
+  #
+  # DependsOn: IGWAttachment — CloudFormation must finish attaching the IGW
+  # before creating this route, otherwise the route would reference an
+  # unattached gateway and fail. !Ref alone does not imply this ordering here.
+  # ---------------------------------------------------------------------------
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+
+  # ---------------------------------------------------------------------------
+  # SUBNET ROUTE TABLE ASSOCIATION
+  # A subnet does not automatically use a route table — you must explicitly
+  # associate them. Without this, the subnet uses the VPC's default (local-only)
+  # route table and the instance cannot reach the internet.
+  # ---------------------------------------------------------------------------
+  SubnetRouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref MinecraftSubnet
+      RouteTableId: !Ref RouteTable
+
+
+  # ===========================================================================
+  # SECURITY GROUP
+  # ===========================================================================
+  # A security group acts as a stateful firewall for your EC2 instance.
+  # "Stateful" means: if you allow inbound traffic on a port, the return
+  # traffic is automatically allowed (you don't need an explicit outbound rule).
+  #
+  # Ingress = inbound rules (traffic coming IN to the instance)
+  # Egress  = outbound rules (traffic going OUT from the instance)
+  # ===========================================================================
+  MinecraftSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Minecraft server - game port and SSH
+      VpcId: !Ref MinecraftVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ServerPort
+          ToPort: !Ref ServerPort
+          CidrIp: '0.0.0.0/0'
+          Description: Minecraft Java clients
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowSshCidr
+          Description: SSH access
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+          Description: Allow all outbound
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-sg'
+
+
+  # ===========================================================================
+  # IAM ROLE + INSTANCE PROFILE
+  # ===========================================================================
+  # IAM controls what AWS services can do what to other AWS services.
+  #
+  # AssumeRolePolicyDocument (the "trust policy"):
+  #   This says "EC2 is allowed to assume this role". Without it, the role
+  #   exists but nothing can use it.
+  #
+  # Managed Policies attached:
+  #   AmazonSSMManagedInstanceCore — allows SSM Session Manager to connect
+  #     without needing an open SSH port or key pair.
+  #   CloudWatchAgentServerPolicy — allows the instance to push metrics and
+  #     logs to CloudWatch.
+  # ===========================================================================
+  MinecraftInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-instance-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-role'
+
+  # Instance Profile — the container that holds the IAM role so EC2 can use it.
+  # EC2 does not attach roles directly; it attaches instance profiles.
+  MinecraftInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-instance-profile'
+      Roles:
+        - !Ref MinecraftInstanceRole
+
+
+  # ===========================================================================
+  # ELASTIC IP
+  # ===========================================================================
+  # By default, EC2 instances get a random public IP that changes every time
+  # the instance stops and starts. An Elastic IP is a static public IP address
+  # you own — it stays the same even when the instance restarts.
+  #
+  # DependsOn: IGWAttachment — an EIP in a VPC requires the IGW to be attached
+  # first. CloudFormation will not figure this out on its own.
+  # ===========================================================================
+  MinecraftEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: IGWAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-eip'
+
+  EIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref MinecraftInstance
+      EIP: !Ref MinecraftEIP
+
+
+  # ===========================================================================
+  # EC2 INSTANCE
+  # ===========================================================================
+  MinecraftInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+
+      # AMI — resolved at deploy time via SSM Parameter Store.
+      # AWS maintains this path and updates it whenever a new Amazon Linux 2023
+      # ARM AMI is released, so you always get the latest without hard-coding
+      # a region-specific AMI ID.
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64}}'
+
+      InstanceType: !Ref InstanceType
+
+      # !If [ConditionName, value-if-true, value-if-false]
+      # AWS::NoValue tells CloudFormation to omit the property entirely.
+      KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref 'AWS::NoValue']
+
+      IamInstanceProfile: !Ref MinecraftInstanceProfile
+
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: false
+          DeviceIndex: '0'
+          GroupSet:
+            - !Ref MinecraftSecurityGroup
+          SubnetId: !Ref MinecraftSubnet
+
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref EbsVolumeSize
+            VolumeType: gp3
+            DeleteOnTermination: true
+            Encrypted: true
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-server'
+
+      # UserData runs ONCE when the instance first boots.
+      # Fn::Base64 encodes the script as required by EC2.
+      # !Sub substitutes CloudFormation parameter values into the script.
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          exec > >(tee /var/log/minecraft-setup.log | logger -t minecraft-setup) 2>&1
+
+          dnf update -y
+          dnf install -y java-21-amazon-corretto-headless screen wget tar
+
+          useradd -r -m -d /opt/minecraft -s /bin/bash minecraft
+
+          mkdir -p /opt/minecraft/server
+          cd /opt/minecraft/server
+
+          wget -q -O server.jar '${ServerJarUrl}'
+
+          echo "eula=true" > eula.txt
+
+          cat > server.properties <<'PROPS'
+          server-port=${ServerPort}
+          motd=${Motd}
+          difficulty=${Difficulty}
+          max-players=${MaxPlayers}
+          online-mode=${OnlineMode}
+          level-name=world
+          spawn-protection=16
+          enable-command-block=false
+          PROPS
+
+          cat > /opt/minecraft/server/start.sh <<'SCRIPT'
+          #!/bin/bash
+          cd /opt/minecraft/server
+          exec java \
+            -Xmx${JavaMaxRam} \
+            -Xms${JavaMinRam} \
+            -XX:+UseG1GC \
+            -XX:+ParallelRefProcEnabled \
+            -XX:MaxGCPauseMillis=200 \
+            -XX:+UnlockExperimentalVMOptions \
+            -XX:+DisableExplicitGC \
+            -XX:G1NewSizePercent=30 \
+            -XX:G1MaxNewSizePercent=40 \
+            -XX:G1HeapRegionSize=8M \
+            -XX:G1ReservePercent=20 \
+            -XX:G1HeapWastePercent=5 \
+            -XX:G1MixedGCCountTarget=4 \
+            -XX:InitiatingHeapOccupancyPercent=15 \
+            -XX:G1MixedGCLiveThresholdPercent=90 \
+            -XX:G1RSetUpdatingPauseTimePercent=5 \
+            -XX:SurvivorRatio=32 \
+            -XX:+PerfDisableSharedMem \
+            -XX:MaxTenuringThreshold=1 \
+            -jar server.jar nogui
+          SCRIPT
+          chmod +x /opt/minecraft/server/start.sh
+
+          chown -R minecraft:minecraft /opt/minecraft
+
+          cat > /etc/systemd/system/minecraft.service <<'SERVICE'
+          [Unit]
+          Description=Minecraft Java Server
+          After=network.target
+          Wants=network-online.target
+
+          [Service]
+          User=minecraft
+          Group=minecraft
+          WorkingDirectory=/opt/minecraft/server
+          ExecStart=/opt/minecraft/server/start.sh
+          ExecStop=/bin/kill -SIGTERM $MAINPID
+          Restart=on-failure
+          RestartSec=30
+          StandardOutput=journal
+          StandardError=journal
+          SyslogIdentifier=minecraft
+          NoNewPrivileges=true
+          PrivateTmp=true
+          ProtectSystem=strict
+          ReadWritePaths=/opt/minecraft
+
+          [Install]
+          WantedBy=multi-user.target
+          SERVICE
+
+          systemctl daemon-reload
+          systemctl enable minecraft
+          systemctl start minecraft
+
+          echo "Minecraft server setup complete."
+
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+# Outputs are displayed in the CloudFormation console after the stack deploys.
+# They surface useful information — IPs, commands, resource IDs — so you don't
+# have to hunt through the console to find them.
+# =============================================================================
+Outputs:
+
+  ServerIP:
+    Description: Public IP address — share this with your players
+    Value: !Ref MinecraftEIP
+
+  ServerAddress:
+    Description: Server address to paste into Minecraft multiplayer
+    Value: !Sub '${MinecraftEIP}:${ServerPort}'
+
+  InstanceId:
+    Description: EC2 Instance ID (use with SSM Session Manager)
+    Value: !Ref MinecraftInstance
+
+  SSMConnectCommand:
+    Description: Connect to the instance via SSM (no SSH key needed)
+    Value: !Sub 'aws ssm start-session --target ${MinecraftInstance} --region ${AWS::Region}'
+
+  ServerLogsCommand:
+    Description: Tail the Minecraft server logs from inside the instance
+    Value: 'journalctl -u minecraft -f'
+
+  SetupLogLocation:
+    Description: UserData bootstrap log on the instance
+    Value: '/var/log/minecraft-setup.log'
