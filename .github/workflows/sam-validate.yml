@@ -1,0 +1,39 @@
+# .github/workflows/sam-validate.yml
+
+name: SAM Validate CloudFormation Template
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'minecraft-server.yaml'
+  pull_request:
+    paths:
+      - 'minecraft-server.yaml'
+
+jobs:
+  sam-validate:
+    name: SAM validate template
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # aws-actions/setup-sam installs the AWS SAM CLI.
+      # use-installer: true fetches the pre-built binary instead of pip,
+      # which is faster and avoids Python dependency conflicts.
+      - name: Set up SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      # sam validate checks CloudFormation template structure and syntax.
+      # It catches issues cfn-lint doesn't always cover, such as circular
+      # references and certain resource property constraints.
+      # --region is required even without credentials; us-east-1 is used
+      # as a stable default — no AWS account or keys are needed for this check.
+      - name: Validate template with SAM
+        run: sam validate --template minecraft-server.yaml --region us-east-1
