@@ -29,8 +29,15 @@ jobs:
 
       # --append-rules points cfn-lint at the rules/ directory.
       # Runs built-in checks AND your custom rules in one pass.
-      # E rules (errors) cause a non-zero exit and fail the workflow.
-      # W rules (warnings) are shown but don't fail by default.
-      # To make warnings fail too, append: -W
+      #
+      # cfn-lint exit codes:
+      #   0 — no issues
+      #   2 — errors found       (fail the workflow)
+      #   4 — warnings only      (show them, but keep the workflow green)
+      #   6 — errors + warnings  (fail the workflow)
+      #
+      # "|| [ $? -eq 4 ]" lets exit code 4 (warnings only) pass so that
+      # W9001 (SSH CIDR open to the world) is visible in the log without
+      # blocking merges. Errors still fail the workflow.
       - name: Lint template (built-in + custom rules)
-        run: cfn-lint minecraft-server.yaml --append-rules rules/
+        run: cfn-lint minecraft-server.yaml --append-rules rules/ || [ $? -eq 4 ]
