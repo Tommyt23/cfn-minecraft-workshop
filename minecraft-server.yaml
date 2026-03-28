@@ -576,6 +576,23 @@ Resources:
           echo "Minecraft server setup complete."
 
 
+  # ===========================================================================
+  # S3 BUCKET — world backups
+  # ===========================================================================
+  # Stores periodic backups of the Minecraft world folder.
+  # Versioning is enabled so you can restore to any previous point in time.
+  # ===========================================================================
+  WorldBackupBucket:
+    Type: AWS::S3::Backet
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-world-backup'
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-world-backup'
+
+
 # =============================================================================
 # OUTPUTS
 # =============================================================================

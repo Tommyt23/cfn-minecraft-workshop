@@ -71,7 +71,7 @@ Lines starting with **E** are errors and will block the CI check. Lines starting
 
 ## Part 4 — Fix the bugs
 
-There are four things to fix. Three are caught by `cfn-lint`; the fourth only surfaces in the `sam validate` CI job.
+There are five things to fix. Three are caught by `cfn-lint`; two surface in the `sam validate` CI job.
 
 ### Bug 1 — `JavaMaxRam` is too high (E9002)
 
@@ -158,6 +158,24 @@ MinecraftSubnet:
   # DependsOn: MinecraftInstance  <-- remove this line
   Properties:
     ...
+```
+
+</details>
+
+---
+
+### Bug 5 — Invalid resource type on `WorldBackupBucket` (SAM validate)
+
+A new S3 bucket resource has been added for world backups, but the `Type` field contains a typo. CloudFormation resource types are case-sensitive and must be exact — a single character wrong means CloudFormation has no idea what you are trying to create.
+
+Look at the `WorldBackupBucket` resource and find the typo in the `Type` field.
+
+<details>
+<summary>Hint</summary>
+
+```yaml
+WorldBackupBucket:
+  Type: AWS::S3::Bucket   # not AWS::S3::Backet
 ```
 
 </details>
